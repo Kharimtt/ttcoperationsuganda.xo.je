@@ -19,7 +19,7 @@ import yt_dlp
 # ============================================================
 #  CONFIG
 # ============================================================
-DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # In-memory job store (use Redis in production)
