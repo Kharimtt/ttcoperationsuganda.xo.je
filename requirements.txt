@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
-yt-dlp
 python-multipart
+yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
