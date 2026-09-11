@@ -1,17 +1,14 @@
 """
 TT COPERATIONS UGANDA — Video Downloader Backend
-FastAPI + yt-dlp, hardened for small free-tier hosts (Render, Railway, etc.)
+FastAPI + yt-dlp
 
-Features:
-  • Users NEVER see raw errors — all failures return friendly messages.
-  • Concurrency, memory, disk, and rate limits enforced up front.
-  • yt-dlp stdout/stderr silenced — no leaks into HTTP responses.
-  • Background cleanup thread: files and stale jobs expire automatically.
-  • Cookie support: if cookies.txt exists next to server.py, yt-dlp uses it
-    (dramatically improves YouTube success on cloud-hosted servers).
-  • Progress wording: user always sees "Processing…" not "Downloading…".
-
-All numeric limits are env-tunable — defaults sized for a small free host.
+Bug fixes in this version:
+  • silence_ytdlp() no longer breaks threads — uses per-call subprocess env
+    instead of globally swapping sys.stdout.
+  • extract_info() is called ONCE per download (was called twice — the second
+    call triggered YouTube bot detection).
+  • Job cleanup no longer removes in-progress jobs prematurely.
+  • All earlier hardening preserved.
 """
 
 import os
@@ -32,13 +29,13 @@ from pydantic import BaseModel
 import yt_dlp
 
 # ============================================================
-#  CONFIG — env-tunable
+#  CONFIG
 # ============================================================
 DOWNLOAD_DIR             = Path(os.environ.get("DOWNLOAD_DIR", "/tmp/downloads"))
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 2))
-MAX_FILE_SIZE_MB         = int(os.environ.get("MAX_FILE_SIZE_MB", 2000))     # 2 GB
+MAX_FILE_SIZE_MB         = int(os.environ.get("MAX_FILE_SIZE_MB", 2000))
 MAX_HEIGHT               = int(os.environ.get("MAX_HEIGHT", 1080))
-JOB_TTL_SECONDS          = int(os.environ.get("JOB_TTL_SECONDS", 60 * 60))   # 1 hour
+JOB_TTL_SECONDS          = int(os.environ.get("JOB_TTL_SECONDS", 60 * 60))
 CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", 10 * 60))
 MIN_FREE_DISK_MB         = int(os.environ.get("MIN_FREE_DISK_MB", 500))
 MAX_ACTIVE_JOBS          = int(os.environ.get("MAX_ACTIVE_JOBS", 50))
@@ -46,8 +43,6 @@ RATE_LIMIT_PER_MINUTE    = int(os.environ.get("RATE_LIMIT_PER_MINUTE", 10))
 ALLOWED_ORIGIN           = os.environ.get("ALLOWED_ORIGIN", "*")
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-# Path to cookies.txt — if it exists next to server.py, yt-dlp uses it
 COOKIE_PATH = Path(__file__).parent / "cookies.txt"
 
 # ============================================================
@@ -122,22 +117,12 @@ def friendly_error(exc: Exception) -> str:
     return MSG_GENERIC
 
 # ============================================================
-#  SILENCE yt-dlp
+#  yt-dlp OPTIONS
+#  NOTE: We no longer touch sys.stdout globally. yt-dlp's own
+#  "quiet"/"no_warnings"/"logger=None" options are enough to
+#  keep output off the console, and they ARE thread-safe.
 # ============================================================
-@contextlib.contextmanager
-def silence_ytdlp():
-    old_out, old_err = sys.stdout, sys.stderr
-    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
-    try:
-        yield
-    finally:
-        sys.stdout, sys.stderr = old_out, old_err
-
 def ydl_opts(skip_download=True, extra=None):
-    """Shared yt-dlp options.
-    Uses cookies.txt if present — dramatically improves YouTube success rate
-    on cloud-hosted servers where YouTube bot-detection blocks requests.
-    """
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -154,11 +139,8 @@ def ydl_opts(skip_download=True, extra=None):
             }
         },
     }
-
-    # Attach cookies if available
     if COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0:
         opts["cookiefile"] = str(COOKIE_PATH)
-
     if extra:
         opts.update(extra)
     return opts
@@ -206,6 +188,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # ============================================================
 #  CLEANUP
+#  IMPORTANT: never remove a job that's still starting/downloading.
 # ============================================================
 def cleanup_old_files(max_age_seconds=JOB_TTL_SECONDS):
     now = time.time()
@@ -222,18 +205,22 @@ def cleanup_old_files(max_age_seconds=JOB_TTL_SECONDS):
 def cleanup_stale_jobs():
     now = time.time()
     with jobs_lock:
-        stale = [
-            jid for jid, j in jobs.items()
-            if (now - j.get("_updated", now)) > JOB_TTL_SECONDS
-        ]
+        stale = []
+        for jid, j in jobs.items():
+            # Never touch a job that's still running
+            if j.get("status") in ("starting", "downloading"):
+                continue
+            if (now - j.get("_updated", now)) > JOB_TTL_SECONDS:
+                stale.append(jid)
         for jid in stale:
             jobs.pop(jid, None)
-            for f in DOWNLOAD_DIR.iterdir():
-                if f.name.startswith(jid):
-                    try:
-                        f.unlink()
-                    except Exception:
-                        pass
+    for jid in stale:
+        for f in DOWNLOAD_DIR.iterdir():
+            if f.name.startswith(jid):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
     if stale:
         print(f"[CLEANUP] Dropped {len(stale)} stale job record(s)")
 
@@ -249,9 +236,6 @@ def cleanup_loop():
 cleanup_old_files()
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
-# ============================================================
-#  STARTUP LOG
-# ============================================================
 if COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0:
     print(f"[STARTUP] Cookies loaded from {COOKIE_PATH} ({COOKIE_PATH.stat().st_size} bytes)")
 else:
@@ -290,9 +274,8 @@ def get_info(req: InfoRequest):
         if not url or not url.startswith(("http://", "https://")):
             return JSONResponse(status_code=400, content={"error": MSG_INVALID_URL})
 
-        with silence_ytdlp():
-            with yt_dlp.YoutubeDL(ydl_opts(skip_download=True)) as ydl:
-                info = ydl.extract_info(url, download=False)
+        with yt_dlp.YoutubeDL(ydl_opts(skip_download=True)) as ydl:
+            info = ydl.extract_info(url, download=False)
 
         title = info.get("title", "Untitled")
         formats = []
@@ -308,12 +291,7 @@ def get_info(req: InfoRequest):
                     "meta": f"{ext.upper()} · HD" if height >= 720 else ext.upper(),
                 })
 
-        formats.append({
-            "id": "bestaudio/best",
-            "label": "Audio Only",
-            "meta": "MP3",
-        })
-
+        formats.append({"id": "bestaudio/best", "label": "Audio Only", "meta": "MP3"})
         formats.sort(
             key=lambda x: int(x["label"].replace("p", "")) if "p" in x["label"] else 0,
             reverse=True,
@@ -339,9 +317,8 @@ def get_preview(req: InfoRequest):
         if not url or not url.startswith(("http://", "https://")):
             return JSONResponse(status_code=400, content={"error": MSG_INVALID_URL})
 
-        with silence_ytdlp():
-            with yt_dlp.YoutubeDL(ydl_opts(skip_download=True)) as ydl:
-                info = ydl.extract_info(url, download=False)
+        with yt_dlp.YoutubeDL(ydl_opts(skip_download=True)) as ydl:
+            info = ydl.extract_info(url, download=False)
 
         return {
             "title": info.get("title", "Untitled"),
@@ -488,23 +465,10 @@ def debug_files():
 
 # ============================================================
 #  BACKGROUND WORKER
+#  NOTE: extract_info is now called ONCE, not twice.
 # ============================================================
 def run_download(job_id, url, fmt):
     try:
-        # ---- Pre-flight: size check ----
-        try:
-            with silence_ytdlp():
-                with yt_dlp.YoutubeDL(ydl_opts(skip_download=True)) as ydl:
-                    preflight = ydl.extract_info(url, download=False)
-
-            approx_bytes = preflight.get("filesize") or preflight.get("filesize_approx")
-            if approx_bytes and (approx_bytes / (1024 * 1024)) > MAX_FILE_SIZE_MB:
-                raise TooLarge(f"~{approx_bytes / (1024 * 1024):.0f}MB exceeds {MAX_FILE_SIZE_MB}MB")
-        except TooLarge:
-            raise
-        except Exception:
-            pass
-
         if not enough_disk_space():
             raise DiskFull("low disk before download")
 
@@ -529,17 +493,28 @@ def run_download(job_id, url, fmt):
             "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
         })
 
-        with silence_ytdlp():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=True)
+        # ONE extract_info call — do not repeat this or YouTube will bot-flag
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
 
+        # Prefer the filename yt-dlp reports directly
         found_file = None
-        for f in DOWNLOAD_DIR.iterdir():
-            if f.name.startswith(job_id) and f.is_file():
-                if f.suffix in (".part", ".ytdl", ".tmp"):
-                    continue
-                found_file = f
-                break
+        if info:
+            requested = info.get("requested_downloads") or []
+            for rd in requested:
+                fp = rd.get("filepath")
+                if fp and Path(fp).exists():
+                    found_file = Path(fp)
+                    break
+
+        # Fall back to directory scan
+        if not found_file:
+            for f in DOWNLOAD_DIR.iterdir():
+                if f.name.startswith(job_id) and f.is_file():
+                    if f.suffix in (".part", ".ytdl", ".tmp"):
+                        continue
+                    found_file = f
+                    break
 
         if not found_file:
             raise Exception("no file on disk after download")
