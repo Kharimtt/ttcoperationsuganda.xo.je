@@ -2,12 +2,16 @@
 TT COPERATIONS UGANDA — Video Downloader Backend
 FastAPI + yt-dlp, hardened for small free-tier hosts (Render, Railway, etc.)
 
-Changes:
-  • Duration limit REMOVED — any video length allowed.
-  • File-size limit REMAINS (default 2000 MB) as the real guard.
+Features:
+  • Users NEVER see raw errors — all failures return friendly messages.
+  • Concurrency, memory, disk, and rate limits enforced up front.
+  • yt-dlp stdout/stderr silenced — no leaks into HTTP responses.
+  • Background cleanup thread: files and stale jobs expire automatically.
+  • Cookie support: if cookies.txt exists next to server.py, yt-dlp uses it
+    (dramatically improves YouTube success on cloud-hosted servers).
   • Progress wording: user always sees "Processing…" not "Downloading…".
-  • All earlier hardening preserved (semaphore, disk check, rate limit,
-    background cleanup, silent yt-dlp, sanitized errors).
+
+All numeric limits are env-tunable — defaults sized for a small free host.
 """
 
 import os
@@ -42,6 +46,9 @@ RATE_LIMIT_PER_MINUTE    = int(os.environ.get("RATE_LIMIT_PER_MINUTE", 10))
 ALLOWED_ORIGIN           = os.environ.get("ALLOWED_ORIGIN", "*")
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Path to cookies.txt — if it exists next to server.py, yt-dlp uses it
+COOKIE_PATH = Path(__file__).parent / "cookies.txt"
 
 # ============================================================
 #  JOB STATE
@@ -127,6 +134,10 @@ def silence_ytdlp():
         sys.stdout, sys.stderr = old_out, old_err
 
 def ydl_opts(skip_download=True, extra=None):
+    """Shared yt-dlp options.
+    Uses cookies.txt if present — dramatically improves YouTube success rate
+    on cloud-hosted servers where YouTube bot-detection blocks requests.
+    """
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -143,6 +154,11 @@ def ydl_opts(skip_download=True, extra=None):
             }
         },
     }
+
+    # Attach cookies if available
+    if COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0:
+        opts["cookiefile"] = str(COOKIE_PATH)
+
     if extra:
         opts.update(extra)
     return opts
@@ -234,6 +250,14 @@ cleanup_old_files()
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
 # ============================================================
+#  STARTUP LOG
+# ============================================================
+if COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0:
+    print(f"[STARTUP] Cookies loaded from {COOKIE_PATH} ({COOKIE_PATH.stat().st_size} bytes)")
+else:
+    print("[STARTUP] No cookies.txt found — YouTube may block many requests")
+
+# ============================================================
 #  REQUEST MODELS
 # ============================================================
 class InfoRequest(BaseModel):
@@ -256,6 +280,7 @@ def health():
         "max_concurrent": MAX_CONCURRENT_DOWNLOADS,
         "max_file_size_mb": MAX_FILE_SIZE_MB,
         "max_height": MAX_HEIGHT,
+        "cookies": COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0,
     }
 
 @app.post("/info")
@@ -490,7 +515,6 @@ def run_download(job_id, url, fmt):
                     downloaded = d.get("downloaded_bytes", 0)
                     if total > 0:
                         pct = int(downloaded / total * 90)
-                        # User always sees "Processing…"
                         touch_job(job_id, percent=pct, stage="Processing…", status="downloading")
                 elif d["status"] == "finished":
                     touch_job(job_id, percent=92, stage="Finalizing…")
