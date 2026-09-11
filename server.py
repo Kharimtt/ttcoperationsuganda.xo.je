@@ -1,7 +1,7 @@
 """
 TT COPERATIONS UGANDA — Video Downloader Backend
 FastAPI + yt-dlp
-Features: metadata preview, format listing, background downloads, safe auto-delete
+Users NEVER see raw errors — all failures return friendly messages.
 """
 
 import os
@@ -10,7 +10,7 @@ import uuid
 import threading
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -22,19 +22,59 @@ import yt_dlp
 DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# In-memory job store (use Redis in production)
+# In-memory job store (use Redis in production for multi-worker setups)
 jobs = {}
 
 app = FastAPI(title="TT COPERATIONS Downloader")
 
-# Allow your website to call this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],   # so the browser can read the filename
+    expose_headers=["Content-Disposition"],
 )
+
+# ============================================================
+#  USER-SAFE ERROR MESSAGES
+#  These are the ONLY strings users ever see.
+# ============================================================
+MSG_INVALID_URL  = "That link doesn't look right. Please paste a valid video URL."
+MSG_UNSUPPORTED  = "Sorry, this video can't be downloaded. It may be private, age-restricted, or from an unsupported platform."
+MSG_NOT_FOUND    = "We couldn't find that video. Please check the link and try again."
+MSG_NETWORK      = "Something went wrong on our side. Please try again in a moment."
+MSG_GENERIC      = "Something went wrong. Please try again."
+MSG_JOB_GONE     = "This download has expired. Please start a new one."
+MSG_FILE_MISSING = "The file is no longer available. Please start a new download."
+
+def friendly_error(exc: Exception) -> str:
+    """
+    Map any internal error to a short, user-safe message.
+    The full error is printed to the server logs for debugging.
+    """
+    text = str(exc).lower()
+    print(f"[ERROR] {type(exc).__name__}: {exc}")
+
+    if any(k in text for k in (
+        "unsupported", "unable to extract", "unable to download",
+        "private", "sign in", "age", "not available",
+        "no video", "video unavailable"
+    )):
+        return MSG_UNSUPPORTED
+    if any(k in text for k in ("not found", "404", "does not exist")):
+        return MSG_NOT_FOUND
+    if any(k in text for k in ("timed out", "timeout", "connection", "network")):
+        return MSG_NETWORK
+    return MSG_GENERIC
+
+# ============================================================
+#  GLOBAL EXCEPTION HANDLER
+#  Catches anything uncaught and returns a clean message.
+# ============================================================
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print(f"[UNCAUGHT] {type(exc).__name__}: {exc}")
+    return JSONResponse(status_code=500, content={"error": MSG_GENERIC})
 
 # ============================================================
 #  CLEANUP ON STARTUP — delete stale files older than 1 hour
@@ -70,17 +110,16 @@ class DownloadRequest(BaseModel):
 @app.post("/info")
 def get_info(req: InfoRequest):
     try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-        }
+        url = (req.url or "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            return JSONResponse(status_code=400, content={"error": MSG_INVALID_URL})
+
+        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=False)
+            info = ydl.extract_info(url, download=False)
 
-        title = info.get("title", "Unknown")
+        title = info.get("title", "Untitled")
         formats = []
-
         seen = set()
         for f in info.get("formats", []):
             height = f.get("height")
@@ -114,7 +153,7 @@ def get_info(req: InfoRequest):
         }
 
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        return JSONResponse(status_code=400, content={"error": friendly_error(e)})
 
 # ============================================================
 #  ROUTE: /preview
@@ -122,31 +161,35 @@ def get_info(req: InfoRequest):
 @app.post("/preview")
 def get_preview(req: InfoRequest):
     try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-        }
+        url = (req.url or "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            return JSONResponse(status_code=400, content={"error": MSG_INVALID_URL})
+
+        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=False)
+            info = ydl.extract_info(url, download=False)
 
         return {
-            "title": info.get("title", "Unknown"),
+            "title": info.get("title", "Untitled"),
             "thumbnail": info.get("thumbnail"),
             "duration": info.get("duration"),
             "uploader": info.get("uploader"),
             "view_count": info.get("view_count"),
-            "webpage_url": info.get("webpage_url", req.url),
+            "webpage_url": info.get("webpage_url", url),
         }
 
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        return JSONResponse(status_code=400, content={"error": friendly_error(e)})
 
 # ============================================================
 #  ROUTE: /download — start a download job
 # ============================================================
 @app.post("/download")
 def start_download(req: DownloadRequest):
+    url = (req.url or "").strip()
+    if not url or not url.startswith(("http://", "https://")):
+        return JSONResponse(status_code=400, content={"error": MSG_INVALID_URL})
+
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "starting",
@@ -156,7 +199,7 @@ def start_download(req: DownloadRequest):
         "error": None,
     }
 
-    thread = threading.Thread(target=run_download, args=(job_id, req.url, req.format))
+    thread = threading.Thread(target=run_download, args=(job_id, url, req.format))
     thread.daemon = True
     thread.start()
 
@@ -169,7 +212,7 @@ def start_download(req: DownloadRequest):
 def get_progress(job_id: str):
     job = jobs.get(job_id)
     if not job:
-        return JSONResponse(status_code=404, content={"error": "Job not found"})
+        return JSONResponse(status_code=404, content={"error": MSG_JOB_GONE})
 
     response = {
         "status": job["status"],
@@ -179,21 +222,20 @@ def get_progress(job_id: str):
     if job["status"] == "done":
         response["download_url"] = f"/file/{job_id}"
     if job["status"] == "error":
-        response["error"] = job["error"]
+        response["error"] = job["error"] or MSG_GENERIC
     return response
 
 # ============================================================
-#  ROUTE: /file/{job_id} — stream file, then delete AFTER last chunk
+#  ROUTE: /file/{job_id} — stream file, delete AFTER last chunk
 # ============================================================
-CHUNK_SIZE = 1024 * 1024  # 1 MB chunks
+CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 @app.get("/file/{job_id}")
 def get_file(job_id: str):
     job = jobs.get(job_id)
     if not job:
-        return JSONResponse(status_code=404, content={"error": "Job not found"})
+        return JSONResponse(status_code=404, content={"error": MSG_JOB_GONE})
 
-    # Try stored path first, then fallback search
     stored = job.get("file")
     if stored and Path(stored).exists():
         path = Path(stored)
@@ -206,13 +248,12 @@ def get_file(job_id: str):
                 path = f
                 break
         if not path:
-            return JSONResponse(status_code=404, content={"error": "File not found on disk"})
+            return JSONResponse(status_code=404, content={"error": MSG_FILE_MISSING})
 
     filename = path.name
     file_size = path.stat().st_size
 
     def file_iterator():
-        """Stream the file in chunks. Delete it only after the last chunk is sent."""
         try:
             with open(path, "rb") as fh:
                 while True:
@@ -220,26 +261,23 @@ def get_file(job_id: str):
                     if not chunk:
                         break
                     yield chunk
-            # If we get here, the generator was consumed → client received everything
             print(f"[STREAM DONE] {filename} — full file sent")
         except Exception as e:
             print(f"[STREAM ERROR] {filename}: {e}")
             raise
         finally:
-            # Delete the file (safe even if generator was closed early)
             try:
                 if path.exists():
                     path.unlink()
                     print(f"[CLEANUP] Deleted {filename}")
             except Exception as e:
                 print(f"[CLEANUP FAIL] {filename}: {e}")
-            # Remove the job entry
             jobs.pop(job_id, None)
 
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
         "Content-Length": str(file_size),
-        "X-Accel-Buffering": "no",   # disable Nginx buffering for true streaming
+        "X-Accel-Buffering": "no",
     }
 
     return StreamingResponse(
@@ -249,15 +287,12 @@ def get_file(job_id: str):
     )
 
 # ============================================================
-#  ROUTE: /debug/jobs
+#  DEBUG ROUTES
 # ============================================================
 @app.get("/debug/jobs")
 def debug_jobs():
     return {"count": len(jobs), "jobs": jobs}
 
-# ============================================================
-#  ROUTE: /debug/files — see what's currently on disk
-# ============================================================
 @app.get("/debug/files")
 def debug_files():
     files = []
@@ -275,17 +310,20 @@ def debug_files():
 # ============================================================
 def run_download(job_id, url, fmt):
     def progress_hook(d):
-        if d["status"] == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            downloaded = d.get("downloaded_bytes", 0)
-            if total > 0:
-                pct = int(downloaded / total * 90)
-                jobs[job_id]["percent"] = pct
-                jobs[job_id]["stage"] = "Downloading…"
-                jobs[job_id]["status"] = "downloading"
-        elif d["status"] == "finished":
-            jobs[job_id]["percent"] = 92
-            jobs[job_id]["stage"] = "Merging streams…"
+        try:
+            if d["status"] == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                downloaded = d.get("downloaded_bytes", 0)
+                if total > 0:
+                    pct = int(downloaded / total * 90)
+                    jobs[job_id]["percent"] = pct
+                    jobs[job_id]["stage"] = "Downloading…"
+                    jobs[job_id]["status"] = "downloading"
+            elif d["status"] == "finished":
+                jobs[job_id]["percent"] = 92
+                jobs[job_id]["stage"] = "Merging streams…"
+        except Exception:
+            pass
 
     ydl_opts = {
         "outtmpl": str(DOWNLOAD_DIR / f"{job_id}.%(ext)s"),
@@ -309,7 +347,7 @@ def run_download(job_id, url, fmt):
                 break
 
         if not found_file:
-            raise Exception("Download finished but no file found on disk")
+            raise Exception("no file on disk after download")
 
         jobs[job_id]["file"] = str(found_file)
         jobs[job_id]["percent"] = 100
@@ -320,9 +358,10 @@ def run_download(job_id, url, fmt):
         print(f"[OK] Job {job_id} → {found_file.name} ({size_mb} MB)")
 
     except Exception as e:
+        # Log real error, store friendly one
         print(f"[FAIL] Job {job_id}: {e}")
         jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(e)
+        jobs[job_id]["error"] = friendly_error(e)
         jobs[job_id]["stage"] = "Failed"
 
 # ============================================================
@@ -330,6 +369,5 @@ def run_download(job_id, url, fmt):
 # ============================================================
 if __name__ == "__main__":
     import uvicorn
-    import os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
