@@ -5,9 +5,12 @@ Users NEVER see raw errors — all failures return friendly messages.
 """
 
 import os
+import sys
 import time
 import uuid
 import threading
+import contextlib
+import io
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -22,7 +25,6 @@ import yt_dlp
 DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# In-memory job store (use Redis in production for multi-worker setups)
 jobs = {}
 
 app = FastAPI(title="TT COPERATIONS Downloader")
@@ -36,48 +38,87 @@ app.add_middleware(
 )
 
 # ============================================================
-#  USER-SAFE ERROR MESSAGES
-#  These are the ONLY strings users ever see.
+#  USER-SAFE MESSAGES — ONLY these ever reach the browser
 # ============================================================
-MSG_INVALID_URL  = "That link doesn't look right. Please paste a valid video URL."
-MSG_UNSUPPORTED  = "Sorry, this video can't be downloaded. It may be private, age-restricted, or from an unsupported platform."
-MSG_NOT_FOUND    = "We couldn't find that video. Please check the link and try again."
-MSG_NETWORK      = "Something went wrong on our side. Please try again in a moment."
-MSG_GENERIC      = "Something went wrong. Please try again."
-MSG_JOB_GONE     = "This download has expired. Please start a new one."
-MSG_FILE_MISSING = "The file is no longer available. Please start a new download."
+MSG_INVALID_URL   = "That link doesn't look right. Please paste a valid video URL."
+MSG_UNSUPPORTED   = "Sorry, this video can't be downloaded right now. Please try a different link or platform."
+MSG_NOT_FOUND     = "We couldn't find that video. Please check the link and try again."
+MSG_NETWORK       = "The server is busy. Please try again in a moment."
+MSG_GENERIC       = "Something went wrong. Please try again."
+MSG_JOB_GONE      = "This download has expired. Please start a new one."
+MSG_FILE_MISSING  = "The file is no longer available. Please start a new download."
+MSG_BUSY          = "The server is handling too many requests. Please wait a moment and try again."
+
+def log_error(exc: Exception):
+    """Print the full technical error to the server console ONLY."""
+    print(f"[ERROR] {type(exc).__name__}: {exc}", flush=True)
 
 def friendly_error(exc: Exception) -> str:
-    """
-    Map any internal error to a short, user-safe message.
-    The full error is printed to the server logs for debugging.
-    """
+    """Return a short, user-safe message. Full error goes to logs only."""
+    log_error(exc)
     text = str(exc).lower()
-    print(f"[ERROR] {type(exc).__name__}: {exc}")
 
     if any(k in text for k in (
         "unsupported", "unable to extract", "unable to download",
         "private", "sign in", "age", "not available",
-        "no video", "video unavailable"
+        "no video", "video unavailable", "unexpected response"
     )):
         return MSG_UNSUPPORTED
     if any(k in text for k in ("not found", "404", "does not exist")):
         return MSG_NOT_FOUND
     if any(k in text for k in ("timed out", "timeout", "connection", "network")):
         return MSG_NETWORK
+    if any(k in text for k in ("too many requests", "429", "rate limit")):
+        return MSG_BUSY
     return MSG_GENERIC
 
 # ============================================================
+#  SILENCE yt-dlp COMPLETELY
+#  This prevents yt-dlp from printing to stdout/stderr, which
+#  can leak into responses in some FastAPI configurations.
+# ============================================================
+@contextlib.contextmanager
+def silence_ytdlp():
+    """Redirect stdout/stderr during yt-dlp calls."""
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
+    try:
+        yield
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+def ydl_opts(skip_download=True, extra=None):
+    """Shared yt-dlp options with mobile clients to reduce bot checks."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "no_color": True,
+        "skip_download": skip_download,
+        "noprogress": True,
+        "logger": None,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "web_safari", "web"],
+            }
+        },
+    }
+    if extra:
+        opts.update(extra)
+    return opts
+
+# ============================================================
 #  GLOBAL EXCEPTION HANDLER
-#  Catches anything uncaught and returns a clean message.
 # ============================================================
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    print(f"[UNCAUGHT] {type(exc).__name__}: {exc}")
+    log_error(exc)
     return JSONResponse(status_code=500, content={"error": MSG_GENERIC})
 
 # ============================================================
-#  CLEANUP ON STARTUP — delete stale files older than 1 hour
+#  CLEANUP ON STARTUP
 # ============================================================
 def cleanup_old_files(max_age_seconds=3600):
     now = time.time()
@@ -87,8 +128,8 @@ def cleanup_old_files(max_age_seconds=3600):
             try:
                 f.unlink()
                 removed += 1
-            except Exception as e:
-                print(f"[CLEANUP FAIL] {f.name}: {e}")
+            except Exception:
+                pass
     if removed:
         print(f"[CLEANUP] Removed {removed} stale file(s) on startup")
 
@@ -114,9 +155,9 @@ def get_info(req: InfoRequest):
         if not url or not url.startswith(("http://", "https://")):
             return JSONResponse(status_code=400, content={"error": MSG_INVALID_URL})
 
-        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        with silence_ytdlp():
+            with yt_dlp.YoutubeDL(ydl_opts(skip_download=True)) as ydl:
+                info = ydl.extract_info(url, download=False)
 
         title = info.get("title", "Untitled")
         formats = []
@@ -165,9 +206,9 @@ def get_preview(req: InfoRequest):
         if not url or not url.startswith(("http://", "https://")):
             return JSONResponse(status_code=400, content={"error": MSG_INVALID_URL})
 
-        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        with silence_ytdlp():
+            with yt_dlp.YoutubeDL(ydl_opts(skip_download=True)) as ydl:
+                info = ydl.extract_info(url, download=False)
 
         return {
             "title": info.get("title", "Untitled"),
@@ -182,7 +223,7 @@ def get_preview(req: InfoRequest):
         return JSONResponse(status_code=400, content={"error": friendly_error(e)})
 
 # ============================================================
-#  ROUTE: /download — start a download job
+#  ROUTE: /download
 # ============================================================
 @app.post("/download")
 def start_download(req: DownloadRequest):
@@ -226,9 +267,9 @@ def get_progress(job_id: str):
     return response
 
 # ============================================================
-#  ROUTE: /file/{job_id} — stream file, delete AFTER last chunk
+#  ROUTE: /file/{job_id}
 # ============================================================
-CHUNK_SIZE = 1024 * 1024  # 1 MB
+CHUNK_SIZE = 1024 * 1024
 
 @app.get("/file/{job_id}")
 def get_file(job_id: str):
@@ -261,7 +302,7 @@ def get_file(job_id: str):
                     if not chunk:
                         break
                     yield chunk
-            print(f"[STREAM DONE] {filename} — full file sent")
+            print(f"[STREAM DONE] {filename}")
         except Exception as e:
             print(f"[STREAM ERROR] {filename}: {e}")
             raise
@@ -321,22 +362,21 @@ def run_download(job_id, url, fmt):
                     jobs[job_id]["status"] = "downloading"
             elif d["status"] == "finished":
                 jobs[job_id]["percent"] = 92
-                jobs[job_id]["stage"] = "Merging streams…"
+                jobs[job_id]["stage"] = "Processing…"
         except Exception:
             pass
 
-    ydl_opts = {
+    opts = ydl_opts(skip_download=False, extra={
         "outtmpl": str(DOWNLOAD_DIR / f"{job_id}.%(ext)s"),
         "format": fmt,
         "progress_hooks": [progress_hook],
-        "quiet": True,
-        "no_warnings": True,
         "merge_output_format": "mp4",
-    }
+    })
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=True)
+        with silence_ytdlp():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
 
         found_file = None
         for f in DOWNLOAD_DIR.iterdir():
@@ -358,8 +398,7 @@ def run_download(job_id, url, fmt):
         print(f"[OK] Job {job_id} → {found_file.name} ({size_mb} MB)")
 
     except Exception as e:
-        # Log real error, store friendly one
-        print(f"[FAIL] Job {job_id}: {e}")
+        log_error(e)
         jobs[job_id]["status"] = "error"
         jobs[job_id]["error"] = friendly_error(e)
         jobs[job_id]["stage"] = "Failed"
