@@ -2,14 +2,12 @@
 TT COPERATIONS UGANDA — Video Downloader Backend
 FastAPI + yt-dlp, hardened for small free-tier hosts (Render, Railway, etc.)
 
-Changes from previous version:
-  • Duration limit REMOVED — any video length is allowed.
-  • File-size limit REMAINS (default 2000 MB) — this is the real guard
-    against free-tier disk/memory/bandwidth exhaustion.
-  • MAX_HEIGHT cap bumped to 2160 (offered), with sensible default 1080
-    still recommended for free tier via env var.
-  • Better disk-space pre-check with headroom for FFmpeg merge.
-  • Longer socket_timeout for large downloads.
+Changes:
+  • Duration limit REMOVED — any video length allowed.
+  • File-size limit REMAINS (default 2000 MB) as the real guard.
+  • Progress wording: user always sees "Processing…" not "Downloading…".
+  • All earlier hardening preserved (semaphore, disk check, rate limit,
+    background cleanup, silent yt-dlp, sanitized errors).
 """
 
 import os
@@ -35,10 +33,10 @@ import yt_dlp
 DOWNLOAD_DIR             = Path(os.environ.get("DOWNLOAD_DIR", "/tmp/downloads"))
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 2))
 MAX_FILE_SIZE_MB         = int(os.environ.get("MAX_FILE_SIZE_MB", 2000))     # 2 GB
-MAX_HEIGHT               = int(os.environ.get("MAX_HEIGHT", 1080))          # offered quality cap
-JOB_TTL_SECONDS          = int(os.environ.get("JOB_TTL_SECONDS", 60 * 60))  # 1 hour
+MAX_HEIGHT               = int(os.environ.get("MAX_HEIGHT", 1080))
+JOB_TTL_SECONDS          = int(os.environ.get("JOB_TTL_SECONDS", 60 * 60))   # 1 hour
 CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", 10 * 60))
-MIN_FREE_DISK_MB         = int(os.environ.get("MIN_FREE_DISK_MB", 500))     # headroom for merge
+MIN_FREE_DISK_MB         = int(os.environ.get("MIN_FREE_DISK_MB", 500))
 MAX_ACTIVE_JOBS          = int(os.environ.get("MAX_ACTIVE_JOBS", 50))
 RATE_LIMIT_PER_MINUTE    = int(os.environ.get("RATE_LIMIT_PER_MINUTE", 10))
 ALLOWED_ORIGIN           = os.environ.get("ALLOWED_ORIGIN", "*")
@@ -85,7 +83,6 @@ MSG_RATE_LIMITED = "You're sending requests too quickly. Please wait a minute an
 def too_large_msg() -> str:
     return f"This file is larger than our {MAX_FILE_SIZE_MB}MB limit. Please try a lower quality."
 
-# Internal sentinel exceptions
 class TooLarge(Exception):  pass
 class DiskFull(Exception):  pass
 
@@ -137,7 +134,7 @@ def ydl_opts(skip_download=True, extra=None):
         "skip_download": skip_download,
         "noprogress": True,
         "logger": None,
-        "socket_timeout": 60,          # longer for large files
+        "socket_timeout": 60,
         "retries": 5,
         "fragment_retries": 5,
         "extractor_args": {
@@ -358,7 +355,7 @@ def start_download(req: DownloadRequest, request: Request):
         jobs[job_id] = {
             "status": "starting",
             "percent": 0,
-            "stage": "Preparing…",
+            "stage": "Processing…",
             "file": None,
             "error": None,
             "_updated": time.time(),
@@ -469,7 +466,7 @@ def debug_files():
 # ============================================================
 def run_download(job_id, url, fmt):
     try:
-        # ---- Pre-flight: size check ONLY (duration is now unlimited) ----
+        # ---- Pre-flight: size check ----
         try:
             with silence_ytdlp():
                 with yt_dlp.YoutubeDL(ydl_opts(skip_download=True)) as ydl:
@@ -493,9 +490,10 @@ def run_download(job_id, url, fmt):
                     downloaded = d.get("downloaded_bytes", 0)
                     if total > 0:
                         pct = int(downloaded / total * 90)
-                        touch_job(job_id, percent=pct, stage="Downloading…", status="downloading")
+                        # User always sees "Processing…"
+                        touch_job(job_id, percent=pct, stage="Processing…", status="downloading")
                 elif d["status"] == "finished":
-                    touch_job(job_id, percent=92, stage="Processing…")
+                    touch_job(job_id, percent=92, stage="Finalizing…")
             except Exception:
                 pass
 
@@ -522,7 +520,6 @@ def run_download(job_id, url, fmt):
         if not found_file:
             raise Exception("no file on disk after download")
 
-        # Post-download size check
         actual_mb = found_file.stat().st_size / (1024 * 1024)
         if actual_mb > MAX_FILE_SIZE_MB:
             found_file.unlink()
